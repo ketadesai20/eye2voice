@@ -5,15 +5,15 @@ from pathlib import Path
 from PIL import Image
 import torchvision.transforms as transforms
 import scipy.io
+import pandas as pd
 
 
 class SubtractMean(object):
     """
-    Matches ITrackerData.py behavior, but implemented more robustly:
+    Subtract a per-pixel mean image (loaded from iTracker .mat mean files).
 
-    - meanImg is stored as HWC float32 in 0..255
-    - convert to CHW float32 in 0..1 via (meanImg/255) and permute
-    - subtract elementwise from input tensor (C,H,W) in 0..1
+    meanImg expected as HWC float32 in 0..255.
+    We convert to CHW float32 in 0..1 to match torchvision ToTensor output.
     """
     def __init__(self, meanImg: np.ndarray):
         mean = (meanImg / 255.0).astype(np.float32)     # HWC, 0..1
@@ -21,53 +21,56 @@ class SubtractMean(object):
         self.meanImg = mean
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        # Ensure mean lives on the same device/dtype as the incoming tensor
         mean = self.meanImg.to(device=tensor.device, dtype=tensor.dtype)
         return tensor.sub(mean)
 
 
 def _load_mean_image(mat_path: Path) -> np.ndarray:
-    """Loads 'image_mean' from a .mat file."""
+    """Loads 'image_mean' from a .mat file as float32."""
     mat = scipy.io.loadmat(str(mat_path))
     return mat["image_mean"].astype(np.float32)
 
 
-class CEALDataset(Dataset):
+class CEALManifestDataset(Dataset):
     """
-    CEAL -> iTracker input adapter.
+    Dataset that reads iTracker-ready artifacts from a manifest.csv produced by Step 2 pipeline.
 
-    Returns a tuple shaped for ITrackerModel.forward:
-        (face, left_eye, right_eye, face_grid, label)
+    Each item returns:
+      (sample_id, face, left, right, facegrid)
 
-    Notes:
-    - face/left/right are torch.float32 tensors shaped (3,224,224)
-      produced by Resize -> ToTensor -> SubtractMean(mean image)
-    - face_grid is torch.float32 shaped (25,25) (placeholder by default)
-    - label is optional; return None or a dummy tensor if you don't have it yet
+    Where:
+      - face/left/right: torch.float32 (3,224,224)
+      - facegrid: torch.float32 (625,)  (flattened 25x25)
     """
     def __init__(
         self,
-        ceal_root: str | Path,
-        samples,  # list of sample records/paths, or a DataFrame-like
+        manifest_csv: str | Path,
         itracker_pytorch_dir: str | Path,
-        grid_size: int = 25,
         image_size: tuple[int, int] = (224, 224),
-        return_label: bool = False,
+        grid_size: int = 25,
+        only_ok: bool = True,
     ):
-        # --- CEAL-side bookkeeping ---
-        self.ceal_root = Path(ceal_root)
-        self.samples = samples
-        self.return_label = return_label
+        self.manifest_csv = Path(manifest_csv)
+        self.itracker_pytorch_dir = Path(itracker_pytorch_dir)
+        self.grid_size = grid_size
 
-        # --- iTracker preprocessing assets ---
-        itracker_pytorch_dir = Path(itracker_pytorch_dir)
+        # Load manifest
+        df = pd.read_csv(self.manifest_csv)
 
-        # mean images (HWC float32, 0..255)
-        self.face_mean = _load_mean_image(itracker_pytorch_dir / "mean_face_224.mat")
-        self.left_mean = _load_mean_image(itracker_pytorch_dir / "mean_left_224.mat")
-        self.right_mean = _load_mean_image(itracker_pytorch_dir / "mean_right_224.mat")
+        # Keep only successful rows unless you explicitly want failures
+        if only_ok:
+            df = df[df["status"] == "ok"].reset_index(drop=True)
 
-        # transforms: match ITrackerData.py (Resize -> ToTensor -> mean-image subtraction)
+        # Store as DataFrame for easy column access in __getitem__
+        self.df = df
+
+        # Load mean images (HWC float32, 0..255)
+        self.face_mean = _load_mean_image(self.itracker_pytorch_dir / "mean_face_224.mat")
+        self.left_mean = _load_mean_image(self.itracker_pytorch_dir / "mean_left_224.mat")
+        self.right_mean = _load_mean_image(self.itracker_pytorch_dir / "mean_right_224.mat")
+
+        # Preprocessing expected by pretrained iTracker checkpoint:
+        # Resize -> ToTensor (0..1) -> subtract mean image (also 0..1)
         self.transform_face = transforms.Compose([
             transforms.Resize(image_size),
             transforms.ToTensor(),
@@ -84,67 +87,42 @@ class CEALDataset(Dataset):
             SubtractMean(meanImg=self.right_mean),
         ])
 
-        # faceGrid config
-        self.grid_size = grid_size
-
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.df)
 
-    def _make_placeholder_face_grid(self) -> torch.Tensor:
-        """
-        Placeholder face grid (grid_size x grid_size) until we compute a real face bounding box mapping.
-        For now: a centered block of ones.
-        """
-        g = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        c = self.grid_size // 2
-        r = max(1, self.grid_size // 10)
-        g[c - r:c + r + 1, c - r:c + r + 1] = 1.0
-        return torch.from_numpy(g)
+    def _load_rgb(self, path: str) -> Image.Image:
+        """Load an RGB image from disk as PIL."""
+        return Image.open(path).convert("RGB")
 
     def __getitem__(self, idx: int):
-        # --- 1) load CEAL sample record ---
-        # samples can be a list-like OR a DataFrame-like (iloc)
-        try:
-            sample = self.samples[idx]
-        except Exception:
-            sample = self.samples.iloc[idx]
+        row = self.df.iloc[idx]
 
-        # --- 1) load CEAL image(s) ---
-        # TODO: replace with your actual CEAL image path logic.
-        #
-        # Example if `sample` is a relative path string:
-        #   img_path = self.ceal_root / sample
-        #   img = Image.open(img_path).convert("RGB")
-        #
-        # Example if `sample` is a dict/Series with a key:
-        #   img_path = self.ceal_root / sample["path"]
-        #   img = Image.open(img_path).convert("RGB")
+        sample_id = row["sample_id"]
 
-        raise NotImplementedError(
-            "Wire CEAL loading: define `img_path` and load a PIL RGB image (or separate face/eye crops)."
-        )
+        # Paths produced by Step 2 pipeline
+        face_path = row["face_path"]
+        left_path = row["left_path"]
+        right_path = row["right_path"]
+        facegrid_path = row["facegrid_path"]
 
-        # --- 2) crop face / left / right ---
-        # TODO: replace with real cropping. Options:
-        # - if CEAL already has crops, load them directly as PIL images.
-        # - if you have bounding boxes/landmarks, crop here.
-        #
-        # face_pil = ...
-        # left_pil = ...
-        # right_pil = ...
+        # 1) Load crops as PIL RGB
+        face_pil = self._load_rgb(face_path)
+        left_pil = self._load_rgb(left_path)
+        right_pil = self._load_rgb(right_path)
 
-        # --- 3-4) resize + normalize (done via transforms) ---
-        # face = self.transform_face(face_pil)      # (3,224,224) float32
-        # left = self.transform_left(left_pil)      # (3,224,224) float32
-        # right = self.transform_right(right_pil)   # (3,224,224) float32
+        # 2) Apply preprocessing transforms (resize is idempotent if already 224x224)
+        face = self.transform_face(face_pil)     # (3,224,224)
+        left = self.transform_left(left_pil)     # (3,224,224)
+        right = self.transform_right(right_pil)  # (3,224,224)
 
-        # --- faceGrid (placeholder for now) ---
-        # face_grid = self._make_placeholder_face_grid()  # (grid_size, grid_size) float32
+        # 3) Load facegrid (625,) float32
+        facegrid_np = np.load(facegrid_path).astype(np.float32)
 
-        # --- 5) return tensors + label ---
-        # if self.return_label:
-        #     label = ...  # TODO: CEAL label (classification) or regression target
-        # else:
-        #     label = None
-        #
-        # return face, left, right, face_grid, label
+        # Safety: enforce expected shape
+        expected = self.grid_size * self.grid_size
+        if facegrid_np.shape != (expected,):
+            raise ValueError(f"facegrid has shape {facegrid_np.shape}, expected ({expected},) at {facegrid_path}")
+
+        facegrid = torch.from_numpy(facegrid_np)  # (625,)
+
+        return sample_id, face, left, right, facegrid
