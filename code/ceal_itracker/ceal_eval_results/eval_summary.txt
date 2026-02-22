@@ -1,0 +1,14 @@
+CEAL iTracker Evaluation Summary
+==================================================
+Total samples:        23520
+Coordinate correction: pred_x negated (camera→user)
+
+Centroid accuracy:    0.3781 (37.8%)
+Axis threshold acc:   0.3921 (39.2%)
+Best method:          axis_threshold
+
+Key findings:
+  - x-axis was inverted (iTracker uses camera perspective)
+  - After correction, left/right should separate properly
+  - Check scatter plot to verify directional clusters
+  - Check head pose analysis for pose sensitivity
