@@ -1,0 +1,43 @@
+# requirements.txt
+# =================
+# Python dependencies for the Eye2Voice inference backend.
+# Used by both the local Flask server and the Lambda Docker container.
+#
+# Install for local development:
+#   pip install -r backend/requirements.txt
+#
+# Notes on version pinning:
+#   - torch and torchvision must use the CPU-only wheels for Lambda
+#     (Lambda has no GPU; the full CUDA build adds ~2 GB unnecessarily)
+#   - Versions are pinned to match the training environment where possible
+
+# ── Deep learning ───────────────────────────────────────────────────────────
+# CPU-only PyTorch wheel (much smaller than CUDA version: ~200 MB vs ~700 MB)
+# The --extra-index-url is needed to find the CPU-specific wheel.
+# Add this to your pip install command:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+torchvision==0.20.1
+
+# ── Image processing ────────────────────────────────────────────────────────
+# Pillow: used by torchvision.transforms and our decode_image() function
+# to open and resize JPEG images
+Pillow>=10.0.0
+
+# ── Numeric ─────────────────────────────────────────────────────────────────
+# numpy: used internally by PyTorch and PIL; pin to a version compatible
+# with both torch 2.5 and mediapipe
+numpy>=1.24.0,<2.0.0
+
+# ── AWS (Lambda only) ────────────────────────────────────────────────────────
+# boto3: AWS Python SDK, used by lambda_handler.py to download the model from S3
+# Pre-installed in Lambda containers, but included here for local testing
+boto3>=1.34.0
+
+# ── Web server (local development only) ─────────────────────────────────────
+# Flask: lightweight Python web framework for the local inference server
+flask>=3.0.0
+
+# flask-cors: adds Cross-Origin Resource Sharing headers to Flask responses
+# Required so the React dev server (port 3000) can call Flask (port 5000)
+flask-cors>=4.0.0
